@@ -1,0 +1,68 @@
+/**
+ * *****************************************************************************
+ * @file        transaction.proto
+ * @brief       transaction related agreements
+ * @author  ()
+ * @date        2023-09-27
+ * @copyright   mm
+ * *****************************************************************************
+ */
+
+syntax = "proto3";
+
+import "sign.proto";
+
+
+//prev out put utxo hash
+message CTxPrevOutput{
+  string hash = 1;  //utxo hash
+  uint32 n    = 2;  //utxo num
+}
+
+//transaction in put
+message CTxInput{
+  repeated CTxPrevOutput prevOut = 1;
+  CSign  vinSign      = 2;  //vin sing
+  uint32 sequence     = 3;  //sequence
+  string contractAddr = 4;  //contract addr 
+}
+
+//transaction out put
+message CTxOutput{
+  int64 value = 1;  //transaction to addr num
+  string addr = 2;  //transaction to addr
+}
+
+message CTxUtxos{
+  repeated string owner    = 1; //transaction owner
+  repeated CTxInput vin    = 2;
+  repeated CTxOutput vout  = 3;
+  repeated CSign multiSign = 4; //sign
+  string assetType      = 5;
+  int64 GasUtxo            = 6;
+}
+
+
+//transaction
+message CTransaction{
+  uint32 version            = 1;  //version
+  uint64 time               = 2;  //transaction time
+  uint32 n                  = 3;  
+  string identity           = 4;  //identity
+  string hash               = 5;  //transaction hash
+  string type               = 6;  //type
+  uint32 consensus          = 7;  //consensus num
+  
+  uint32 txType             = 8;  //transaction type
+
+  string data               = 9; //transaction data
+  string info               = 10; //transaction info
+  repeated CSign verifySign = 11; //sign
+
+  string reserve0           = 12;
+  string reserve1           = 13;
+  
+  repeated CTxUtxos utxos   = 14;
+  uint32 gasTx              = 15;
+  uint64    nonce           = 16;
+}

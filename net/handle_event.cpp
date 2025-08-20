@@ -1,0 +1,1009 @@
+#include "handle_event.h"
+
+#include <cstddef>
+#include <exception>
+#include <fstream>
+#include <unordered_set>
+#include <utility>
+#include <iomanip>
+
+#include "./pack.h"
+#include "./ip_port.h"
+#include "./global.h"
+
+
+#include "../common/config.h"
+#include "../common/global.h"
+#include "../common/global_data.h"
+#include "../db/db_api.h"
+#include "../net/dispatcher.h"
+#include "../net/peer_node.h"
+#include "../net/socket_buf.h"
+#include "../net/test.hpp"
+#include "../net/unregister_node.h"
+#include "../net/interface.h"
+#include "../include/logging.h"
+#include "../include/scope_guard.h"
+#include "../proto/common.pb.h"
+#include "../proto/net.pb.h"
+#include "../utils/account_manager.h"
+#include "../utils/console.h"
+#include "../utils/cycliclist.hpp"
+#include "../utils/hex_code.h"
+#include "../utils/magic_singleton.h"
+#include "../utils/tmp_log.h"
+#include "../utils/contract_utils.h"
+
+int processPrintMessageRequest(const std::shared_ptr<PrintMsgReq> &requestToPrintMessage, const MsgData &from)
+{
+	static int printMsCount = 0;
+	int type = requestToPrintMessage->type();
+	if (type == 0)
+	{
+		std::cout << ++printMsCount << " times data:" << requestToPrintMessage->data() << std::endl;
+	}
+	else
+	{
+		std::ofstream file("bigdata.txt", std::fstream::out);
+		file << requestToPrintMessage->data();
+		file.close();
+		std::cout << "write bigdata.txt success!!!" << std::endl;
+	}
+	return 0;
+}
+
+static std::mutex nodeMutex;
+int handleRegisterNodeRequest(const std::shared_ptr<RegisterNodeReq> &registerNode, const MsgData &from)
+{
+	INFOLOG("handleRegisterNodeRequest");
+	DEBUGLOG("handleRegisterNodeRequest from.ip:{} from.port:{} from.fd:{}", IpPort::IpSz(from.ip),from.port,from.fd);
+
+
+	Node selfNode = MagicSingleton<PeerNode>::GetInstance()->GetSelfNode();
+
+	std::lock_guard<std::mutex> lock(nodeMutex);
+	NodeInfo *nodeInfo = registerNode->mutable_mynode();
+	Node node;
+	std::string dest_pub = nodeInfo->pub();
+	std::string destAddr = nodeInfo->addr();
+
+	node.fd = from.fd;
+	node.address = destAddr;
+	node.identity = nodeInfo->identity();
+	node.name = nodeInfo->name();
+	node.logo = nodeInfo->logo();
+	node.pub = dest_pub;
+	node.sign = nodeInfo->sign();
+	node.listenIp = selfNode.listenIp;
+	node.listenPort = kServerMainPort;
+	node.publicIp = from.ip;
+	node.publicPort = from.port;
+	node.height = nodeInfo->height();
+	node.ver = nodeInfo->version();
+
+	int ret = 0;
+	ON_SCOPE_EXIT{
+		if (ret != 0)
+		{
+			DEBUGLOG("register node failed and disconnect.from.ip:{} from.port:{} from.fd:{},  ret:{}", IpPort::IpSz(node.publicIp),node.publicPort,node.fd, ret);
+			MagicSingleton<PeerNode>::GetInstance()->DisconnectNode(node);
+		}
+	};
+
+
+	//Multiple registration of the same IP address is prohibited
+	std::vector<Node> pubNodeList_ = MagicSingleton<PeerNode>::GetInstance()->GetNodelist();
+	auto result = std::find_if(pubNodeList_.begin(), pubNodeList_.end(),[&from](auto & node){ return from.ip == node.publicIp;});
+	if(result != pubNodeList_.end())
+	{
+		return ret -= 1;
+	}
+		
+	//Prohibit intranet node connection
+	if(IpPort::IsLan(IpPort::IpSz(from.ip)) == true)
+	{
+		ERRORLOG("{} is an intranet node", IpPort::IpSz(from.ip));
+		return ret -= 2;
+	}
+
+	// Judge whether the version is compatible
+    if (0 != Util::IsVersionCompatible(nodeInfo->version()))
+    {
+        ERRORLOG("Incompatible version!");
+        return ret -= 3;
+    }
+
+	if(node.address == MagicSingleton<AccountManager>::GetInstance()->GetDefaultAddr())
+    {
+        ERRORLOG("Don't register yourself ");
+        return ret -= 4;
+    }
+
+	EVP_PKEY* eckey = nullptr;
+
+
+	std::string node_addr = nodeInfo->addr();
+	if (!isValidAddress(node_addr))
+	{
+		ERRORLOG("address invalid !!");
+		return ret -= 5;
+	}
+
+	std::string Addr = GenerateAddr(nodeInfo->identity());
+	DEBUGLOG("nodeInfo pub strhex is {}",Str2Hex(nodeInfo->identity()));
+	if (Addr != node_addr)
+	{
+		ERRORLOG("Addr is {}", Addr);
+		ERRORLOG("node_addr is {}", node_addr);
+		ERRORLOG("address error !!");
+		return ret -= 6;
+	}
+
+	if(nodeInfo->identity().size() <= 0)
+	{
+		ERRORLOG("public key is empty");
+		return ret -= 7;
+	}
+
+	Account account;
+	if(MagicSingleton<AccountManager>::GetInstance()->getAccountPublicKeyByBytes(nodeInfo->identity(), account) == false){
+		ERRORLOG(RED "Get public key from bytes failed!" RESET);
+		return ret -= 8;
+	}
+
+
+	std::string nodeInfo_signature = nodeInfo->sign();
+	if(account.Verify(Getsha256hash(Addr), nodeInfo_signature) == false)
+	{
+		ERRORLOG(RED "Public key verify sign failed!" RESET);
+		return ret -= 9;
+	}
+
+	
+	Node temNode;
+	auto find = MagicSingleton<PeerNode>::GetInstance()->FindNode(node.address, temNode);
+	if ((find && temNode.connKind == NOTYET) || !find)
+	{
+		node.connKind = PASSIV;
+	}
+	else
+	{
+		node.connKind = temNode.connKind;
+	}
+
+	if (find)
+	{
+		//Determine whether fd is consistent with 
+		if (temNode.fd != from.fd)
+		{
+			if (MagicSingleton<bufferControl>::GetInstance()->IsExists(temNode.publicIp, temNode.publicPort) /*&& temNode.is_established()*/)
+			{
+				// Join to the peernode
+				std::shared_ptr<SocketBuf> ptr = MagicSingleton<bufferControl>::GetInstance()->GetSocketBuf(temNode.publicIp, temNode.publicPort);
+				temNode.fd = ptr->fd;
+				temNode.connKind = PASSIV;
+				DEBUGLOG("handleRegisterNodeRequest Update from.ip:{} from.port:{} from.fd:{}", IpPort::IpSz(node.publicIp),node.publicPort,from.fd);
+				MagicSingleton<PeerNode>::GetInstance()->Update(node);
+			}
+			DEBUGLOG("handleRegisterNodeRequest DisconnectNode from.ip:{} from.port:{} from.fd:{}", IpPort::IpSz(temNode.publicIp),temNode.publicPort,from.fd);
+			MagicSingleton<PeerNode>::GetInstance()->DisconnectNode(temNode);
+		}
+	}
+	else
+	{
+		if (from.ip == node.publicIp && from.port == node.publicPort)
+		{
+			DEBUGLOG("handleRegisterNodeRequest from.ip:{} from.port:{} from.fd:{}", IpPort::IpSz(from.ip),from.port,from.fd);
+			MagicSingleton<PeerNode>::GetInstance()->Add(node);
+		}
+	}
+
+	selfNode.publicIp = from.ip;
+	selfNode.publicPort = from.port;
+	
+	
+	std::string signature;
+
+	Account acc;
+	if(MagicSingleton<AccountManager>::GetInstance()->GetDefaultAccount(acc) != 0)
+	{
+		return ret -= 10;
+	}
+
+	if (selfNode.address != acc.GetAddr())
+	{
+		return ret -= 11;
+	}
+	if(!acc.Sign(Getsha256hash(acc.GetAddr()), signature))
+	{
+		return ret -= 12;
+	}
+
+	selfNode.identity = acc.GetPubStr();
+	selfNode.sign = signature;
+
+	RegisterNodeAck registerNodeAcknowledgment;
+	registerNodeAcknowledgment.set_msg_id(registerNode->msg_id());
+	std::vector<Node> nodeList;
+
+	std::vector<Node> tmp = MagicSingleton<PeerNode>::GetInstance()->GetNodelist();
+	nodeList.push_back(selfNode);
+	if(registerNode->is_get_nodelist() == true)
+	{
+		nodeList.insert(nodeList.end(), tmp.begin(), tmp.end());
+	}
+
+	for (auto &node : nodeList)
+	{		
+		if (node.fd < 0) 
+		{
+			if (node.address != selfNode.address)
+			{
+				ERRORLOG("node  addr is same of self node  addr");
+				continue;
+			}
+		}
+
+		NodeInfo *nodeInfo = registerNodeAcknowledgment.add_nodes();
+
+		nodeInfo->set_addr(node.address);
+		nodeInfo->set_name(node.name);
+		nodeInfo->set_logo(node.logo);
+		nodeInfo->set_listen_ip(node.listenIp);
+		nodeInfo->set_listen_port(node.listenPort);
+		nodeInfo->set_public_ip(node.publicIp);
+		nodeInfo->set_public_port(node.publicPort);
+		nodeInfo->set_identity(node.identity);
+		nodeInfo->set_sign(node.sign);
+		nodeInfo->set_height(node.height);
+		nodeInfo->set_version(node.ver);
+	}
+
+	net_com::SendMessage(destAddr, registerNodeAcknowledgment, net_com::Compress::COMPRESS_TRUE, net_com::Encrypt::ENCRYPT_FALSE, net_com::Priority::kHighPriorityLevel2);
+	return ret;
+}
+
+int handleRegisterNodeAcknowledgment(const std::shared_ptr<RegisterNodeAck> &registerNodeAcknowledgment, const MsgData &from)
+{
+	if(IpPort::IsLan(IpPort::IpSz(from.ip)) == true)
+	{
+		ERRORLOG("{} is an intranet node", IpPort::IpSz(from.ip));
+		return -1;
+	}
+
+	DEBUGLOG("from.ip:{}", IpPort::IpSz(from.ip));
+	registerNodeAcknowledgment->set_from_ip(from.ip);
+	registerNodeAcknowledgment->set_from_port(from.port);
+	registerNodeAcknowledgment->set_fd(from.fd);
+	std::string ipPort = std::to_string(from.ip) + ":" + std::to_string(from.port);
+	dataMgrPtr.waitDataToAdd(registerNodeAcknowledgment->msg_id(), ipPort, registerNodeAcknowledgment->SerializeAsString());
+	return 0;
+}
+
+int RegistrationVerifier(const NodeInfo &nodeInfo, uint32_t &fromIp, uint32_t &fromPort)
+{
+	if(IpPort::IsLan(IpPort::IpSz(fromIp)) == true)
+	{
+		ERRORLOG("{} is an intranet node", IpPort::IpSz(fromIp));
+		return -1;
+	}
+
+	INFOLOG("handleRegisterNodeAcknowledgment");
+
+	auto self_node = MagicSingleton<PeerNode>::GetInstance()->GetSelfNode();
+
+	Node node;
+	node.address = nodeInfo.addr();
+	node.identity = nodeInfo.identity();
+	node.name = nodeInfo.name();
+	node.logo = nodeInfo.logo();
+	node.pub = nodeInfo.pub();
+	node.sign = nodeInfo.sign();
+	node.listenIp = self_node.listenIp;
+	node.listenPort = kServerMainPort;
+	node.publicIp = fromIp;
+	node.publicPort = fromPort;
+	node.height = nodeInfo.height();
+	node.ver = nodeInfo.version();
+
+	// Judge whether the version is compatible
+    if (0 != Util::IsVersionCompatible(nodeInfo.version()))
+    {
+        ERRORLOG("Incompatible version!");
+        return -2;
+    }
+
+	if(!isValidAddress(nodeInfo.addr()))
+	{
+		return -3;
+	}
+
+	std::string Addr = GenerateAddr(node.identity);
+	if (Addr != node.address)
+	{
+		DEBUGLOG("node pub hex is {}", Str2Hex(node.pub));
+		DEBUGLOG("vAddr is {}", Addr);
+		DEBUGLOG("vnode_addr is {}", node.address);
+		return -4;
+	}
+	
+	Account account;
+	if(MagicSingleton<AccountManager>::GetInstance()->getAccountPublicKeyByBytes(node.identity, account) == false){
+		ERRORLOG(RED "Get public key from bytes failed!" RESET);
+		return -5;
+	}
+
+	if(account.Verify(Getsha256hash(Addr), node.sign) == false)
+	{
+		ERRORLOG(RED "Public key verify sign failed!" RESET);
+		return -6;
+	}
+
+	if (node.address == MagicSingleton<PeerNode>::GetInstance()->GetSelfId())
+	{
+		return -7;
+	}
+
+	Node tempNode;
+	bool find_result = MagicSingleton<PeerNode>::GetInstance()->FindNode(node.address, tempNode);
+	if (find_result)
+	{
+		return -8;
+	}
+	else
+	{
+		DEBUGLOG("handleRegisterNodeAcknowledgment node.id: {}", node.address);
+		//Join to the peernode
+		std::shared_ptr<SocketBuf> ptr = MagicSingleton<bufferControl>::GetInstance()->GetSocketBuf(node.publicIp, node.publicPort);
+		
+		DEBUGLOG("from ip : {}, from port: {}", IpPort::IpSz(node.publicIp), node.publicPort);
+
+		if(ptr != NULL)
+		{
+			node.fd = ptr->fd;
+		}
+		else 
+		{
+			return -9;
+		}
+
+		net_com::ANALYSIS_CONNECTION_KIND(node);
+		MagicSingleton<PeerNode>::GetInstance()->Add(node);
+	}
+	return 0;
+}
+
+int HandlePingReq(const std::shared_ptr<PingReq> &pingReq, const MsgData &from)
+{
+	Node node;
+    if(!MagicSingleton<PeerNode>::GetInstance()->locateNodeByFd(from.fd, node))
+    {
+        ERRORLOG("Invalid message peerNode_id:{}, node.address:{}, ip:{}", pingReq->id(), node.address, IpPort::IpSz(from.ip));
+        return -1;
+    }
+    if(pingReq->id() != node.address)
+    {
+        ERRORLOG("Invalid message peerNode_id:{}, node.address:{}, ip:{}", pingReq->id(), node.address, IpPort::IpSz(from.ip));
+        return -2;
+    }
+
+	node.ResetHeart();
+	MagicSingleton<PeerNode>::GetInstance()->AddOrUpdate(node);
+	net_com::sendPongRequestMessage(node);
+	
+	return 0;
+
+}
+
+int handle_pong_request(const std::shared_ptr<PongReq> &pongReq, const MsgData &from)
+{
+	Node node;
+    if(!MagicSingleton<PeerNode>::GetInstance()->locateNodeByFd(from.fd, node))
+    {
+		ERRORLOG("Invalid message peerNode_id:{}, node.address:{}, ip:{}", pongReq->id(), node.address, IpPort::IpSz(from.ip));
+        return -1;
+    }
+    if(pongReq->id() != node.address)
+    {
+        ERRORLOG("Invalid message peerNode_id:{}, node.address:{}, ip:{}", pongReq->id(), node.address, IpPort::IpSz(from.ip));
+        return -2;
+    }
+
+	node.ResetHeart();
+	MagicSingleton<PeerNode>::GetInstance()->AddOrUpdate(node);
+	DEBUGLOG("recv addr:{}, node.address:{}, ip:{}, pulse:{}", pongReq->id(), node.address, IpPort::IpSz(from.ip), node.pulse);
+	return 0;
+
+}
+
+int handleSyncNodeRequest(const std::shared_ptr<SyncNodeReq> &nodeSynchronizationRequestMessage, const MsgData &from)
+{
+	if(IpPort::IsLan(IpPort::IpSz(from.ip)) == true)
+	{
+		ERRORLOG("{} is an intranet node", IpPort::IpSz(from.ip));
+		return -1;
+	}
+
+	DEBUGLOG("handleSyncNodeRequest from.ip:{}", IpPort::IpSz(from.ip));
+	auto self_addr = MagicSingleton<PeerNode>::GetInstance()->GetSelfId();
+	auto self_node = MagicSingleton<PeerNode>::GetInstance()->GetSelfNode();
+
+	SyncNodeAck syncNodeAcknowledgment;
+	//Get all the intranet nodes connected to you
+	std::vector<Node> &&nodeList = MagicSingleton<PeerNode>::GetInstance()->GetNodelist();
+	if (nodeList.size() == 0)
+	{
+		ERRORLOG("nodeList size is 0");
+		return 0;
+	}
+	syncNodeAcknowledgment.set_ids(self_addr);
+	syncNodeAcknowledgment.set_msg_id(nodeSynchronizationRequestMessage->msg_id());
+	for (auto &node : nodeList)
+	{
+		if (node.fd < 0)
+		{
+			ERRORLOG("node fd < 0");
+			continue;
+		}
+
+		NodeInfo *nodeInfo = syncNodeAcknowledgment.add_nodes();
+		nodeInfo->set_addr(node.address);
+		nodeInfo->set_listen_ip(node.listenIp);
+		nodeInfo->set_listen_port(node.listenPort);
+		nodeInfo->set_public_ip(node.publicIp);
+		nodeInfo->set_public_port(node.publicPort);
+		nodeInfo->set_identity(node.identity);
+		nodeInfo->set_height(node.height);
+		nodeInfo->set_version(node.ver);
+	}
+
+	Account account;
+	if(MagicSingleton<AccountManager>::GetInstance()->FindAccount(self_addr, account) != 0)
+	{
+		ERRORLOG("account {} doesn't exist", self_addr);
+		return -2;
+	}
+
+	std::string signature;
+	std::string vinHashSerialized = Getsha256hash(syncNodeAcknowledgment.SerializeAsString());
+	if(!account.Sign(vinHashSerialized, signature))
+	{
+		return -3;
+	}
+
+	CSign * sign = syncNodeAcknowledgment.mutable_sign();
+	sign->set_sign(signature);
+	sign->set_pub(account.GetPubStr());
+	net_com::SendMessage(from, syncNodeAcknowledgment, net_com::Compress::COMPRESS_TRUE, net_com::Encrypt::ENCRYPT_FALSE, net_com::Priority::kHighPriorityLevel2);
+	return 0;
+}
+
+int handleSyncNodeAcknowledgment(const std::shared_ptr<SyncNodeAck> &syncNodeAcknowledgment, const MsgData &from)
+{
+	if(IpPort::IsLan(IpPort::IpSz(from.ip)) == true)
+	{
+		ERRORLOG("{} is an intranet node", IpPort::IpSz(from.ip));
+		return -1;
+	}
+
+	DEBUGLOG("handleSyncNodeAcknowledgment from.ip:{}", IpPort::IpSz(from.ip));
+    if(!PeerNode::verifyPeerNodeIdRequest(from.fd, syncNodeAcknowledgment->ids()))
+    {
+        return -2;
+    }
+
+	dataMgrPtr.waitDataToAdd(syncNodeAcknowledgment->msg_id(), syncNodeAcknowledgment->ids(), syncNodeAcknowledgment->SerializeAsString());
+	return 0;
+}
+
+int HandleEchoReq(const std::shared_ptr<EchoReq> &echoReq, const MsgData &from)
+{
+	if(!PeerNode::verifyPeerNodeIdRequest(from.fd, echoReq->id()))
+    {
+        return -1;
+    }
+	EchoAck echoAck;
+	echoAck.set_id(MagicSingleton<PeerNode>::GetInstance()->GetSelfId());
+	echoAck.set_message(echoReq->message());
+	net_com::SendMessage(echoReq->id(), echoAck, net_com::Compress::COMPRESS_TRUE, net_com::Encrypt::ENCRYPT_FALSE, net_com::Priority::kPriorityLow0);
+	return 0;
+}
+
+int handleEchoAcknowledge(const std::shared_ptr<EchoAck> &echoAck, const MsgData &from)
+{
+	if(!PeerNode::verifyPeerNodeIdRequest(from.fd, echoAck->id()))
+    {
+        return -1;
+    }
+	std::string echo_ack =  echoAck->message();
+	if(-1 == echo_ack.find("_"))
+	{
+		MagicSingleton<echoTest>::GetInstance()->addEchoCatchVar(echo_ack, echoAck->id());
+		return 0;
+	}
+
+	printf("echo from id:%s\tmessage:%s\n",echoAck->id().c_str(), echo_ack.c_str());
+	return 0;
+}
+
+int networkTestRequest(const std::shared_ptr<TestNetReq> &testReq, const MsgData &from)
+{
+	if(!PeerNode::verifyPeerNodeIdRequest(from.fd, testReq->id()))
+    {
+        return -1;
+    }
+	TestNetAck testAck;
+	testAck.set_data(testReq->data());
+	std::string h =testReq->data();
+	if(testReq->hash() == Getsha256hash(h))
+	{
+		testAck.set_hash(h);
+	}
+	else
+	{
+		testAck.set_data("-1");
+	}
+	testAck.set_id(MagicSingleton<PeerNode>::GetInstance()->GetSelfId());
+	testAck.set_time(testReq->time());
+	net_com::SendMessage(testReq->id(), testAck, net_com::Compress::kCompressDisabled, net_com::Encrypt::ENCRYPT_FALSE, net_com::Priority::kPriorityLow0);
+	return 0;
+}
+
+int networkTestAcknowledge(const std::shared_ptr<TestNetAck> &testAck, const MsgData &from)
+{
+	if(!PeerNode::verifyPeerNodeIdRequest(from.fd, testAck->id()))
+    {
+        return -1;
+    }
+
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+	double t = ms.count() - testAck->time();
+	double speed = 20 / (t/1000);
+	MagicSingleton<netTest>::GetInstance()->SetTime(speed);
+	return 0;
+}
+
+int processNodeHeightChangeRequest(const std::shared_ptr<NodeHeightChangedReq>& req, const MsgData& from)
+{
+	DEBUGLOG("ip:{}", IpPort::IpSz(from.ip));
+	Node node;
+    if(!MagicSingleton<PeerNode>::GetInstance()->locateNodeByFd(from.fd, node))
+    {
+        ERRORLOG("Invalid message ip:{}", IpPort::IpSz(from.ip));
+        return -1;
+    }
+    if(req->id() != node.address)
+    {
+        ERRORLOG("Invalid message peerNode_id:{}, node.address:{}", req->id(), node.address);
+        return -2;
+    }
+
+	std::string id = req->id();
+	uint32 height = req->height();
+
+	node.SetHeight(height);
+	MagicSingleton<PeerNode>::GetInstance()->Update(node);
+	DEBUGLOG("success update {}  to height {}", id, height);
+		
+	return 0;
+}
+
+int handleCheckTransactionRequest(const std::shared_ptr<CheckTxReq>& req, const MsgData& from)
+{
+	if (0 != Util::IsVersionCompatible(req->version()))
+	{
+		ERRORLOG("handleBuildBlockBroadcastMessage IsVersionCompatible");
+		return -1;
+	}
+
+	if(req->isresponse() != 0 && req->isresponse() != 1)
+	{
+		ERRORLOG("The field is incorrect");
+		return -2;
+	}
+
+	DBReader dbReader;
+	std::string txRaw;
+
+	CheckTxAck ack;
+	ack.set_version(global::GetVersion());
+	ack.set_msg_id(req->msg_id());
+	for(auto & hash : req->txhash())
+	{
+		CorresHash * correctionHash =  ack.add_flaghash();
+		correctionHash->set_hash(hash);
+		if(DBStatus::DB_SUCCESS == dbReader.getTransactionByHash(hash, txRaw))
+		{
+			correctionHash->set_flag(1);
+			if(req->isresponse())
+			{
+				ack.set_tx(txRaw);
+			}
+		}
+		else
+		{
+			correctionHash->set_flag(0);
+			ack.set_tx("");
+		}
+	}
+	ack.set_addr(MagicSingleton<AccountManager>::GetInstance()->GetDefaultAddr());
+	net_com::SendMessage(from, ack, net_com::Compress::COMPRESS_TRUE, net_com::Encrypt::ENCRYPT_FALSE, net_com::Priority::kHighPriorityLevel2);
+
+	return 0;
+}
+
+int handleCheckTransactionAck(const std::shared_ptr<CheckTxAck>& ack, const MsgData& from)
+{
+	if (0 != Util::IsVersionCompatible(ack->version()))
+	{
+		ERRORLOG("handleBuildBlockBroadcastMessage IsVersionCompatible");
+		return -1;
+	}
+	Node node;
+    if(!MagicSingleton<PeerNode>::GetInstance()->locateNodeByFd(from.fd, node))
+    {
+        ERRORLOG("Invalid message ");
+        return -2;
+    }
+	dataMgrPtr.waitDataToAdd(ack->msg_id(), node.address, ack->SerializeAsString());
+
+	return 0;
+}
+
+int handleNodeAddressChangeRequest(const std::shared_ptr<NodeAddrChangedReq>& req, const MsgData& from)
+{
+	INFOLOG("handleNodeAddressChangeRequest");
+
+	const NodeSign &oldSign = req->oldsign();
+	const NodeSign &newSign = req->newsign();
+
+	std::string oldAddr = GenerateAddr(oldSign.pub());
+	if(!PeerNode::verifyPeerNodeIdRequest(from.fd, oldAddr))
+    {
+        return -1;
+    }
+
+	Account oldAccount;
+	if(MagicSingleton<AccountManager>::GetInstance()->getAccountPublicKeyByBytes(oldSign.pub(), oldAccount) == false){
+		ERRORLOG(RED "Get public key from bytes failed!" RESET);
+		return -2;
+	}
+
+	std::string oldSignature = oldSign.sign();
+	if(oldAccount.Verify(Getsha256hash(GenerateAddr(newSign.pub())), oldSignature) == false)
+	{
+		ERRORLOG(RED "Public key verify sign failed!" RESET);
+		return -3;
+	}
+
+	Account newAccount;
+	if(MagicSingleton<AccountManager>::GetInstance()->getAccountPublicKeyByBytes(newSign.pub(), newAccount) == false){
+		ERRORLOG(RED "Get public key from bytes failed!" RESET);
+		return -4;
+	}
+
+	std::string newSignature = newSign.sign();
+	if(newAccount.Verify(Getsha256hash(GenerateAddr(newSign.pub())), newSignature) == false)
+	{
+		ERRORLOG(RED "Public key verify sign failed!" RESET);
+		return -5;
+	}
+
+	int ret = MagicSingleton<PeerNode>::GetInstance()->UpdateAddress(oldSign.pub(), newSign.pub());
+	return ret;
+}
+
+void initializeCyclicTargetAddresses(const std::shared_ptr<BuildBlockBroadcastMsg>& msg, Cycliclist<std::string> & target_address_cycle_list)
+{
+	std::vector<std::string> targetAddresses;
+	auto castAddrs = msg->castaddrs();
+	if(msg->castaddrs_size() == 0)
+	{
+		std::cout <<" error castaddr empty" << std::endl;
+	}
+
+	for(auto & addr : castAddrs)
+	{
+		targetAddresses.push_back(addr);
+	}
+	
+	std::sort(targetAddresses.begin(), targetAddresses.end());
+	for(auto & addr : targetAddresses)
+	{
+		DEBUGLOG("initializeCyclicTargetAddresses addr : {}", addr);
+		target_address_cycle_list.push_back(addr);
+	}
+}
+
+void initialize_cyclic_node_list(Cycliclist<std::string>& cyclicNodeList) 
+{
+	std::vector<std::string> nodeListAddresses;
+	std::vector<Node> nodeList = MagicSingleton<PeerNode>::GetInstance()->GetNodelist();
+	
+	for(auto &node : nodeList)
+	{
+		nodeListAddresses.push_back(node.address);
+	}
+	std::sort(nodeListAddresses.begin(),nodeListAddresses.end());
+
+	for(auto & addr : nodeListAddresses)
+	{
+		DEBUGLOG("broadcast cyclic list addr : {}", addr);
+		cyclicNodeList.push_back(addr);
+	}
+}
+
+int HandleBroadcastMsg(const std::shared_ptr<BuildBlockBroadcastMsg>& msg, const MsgData& msgData)
+{	
+	DEBUGLOG("handleBuildBlockBroadcastMessage begin");
+
+	//Determine if the version is compatible
+	if (0 != Util::IsVersionCompatible(msg->version()))
+	{
+		ERRORLOG("handleBuildBlockBroadcastMessage IsVersionCompatible");
+		return -1;
+	}
+
+	std::string serBlock = msg->blockraw();
+	CBlock block;
+   
+	if (!block.ParseFromString(serBlock))
+	{
+		ERRORLOG("handleBuildBlockBroadcastMessage block ParseFromString failed");
+		return -2;
+	}
+
+	std::vector<Cycliclist<std::string>::iterator> upperBoundary;
+	std::vector<Cycliclist<std::string>::iterator> lowerBoundary;
+	Cycliclist<std::string>::iterator targetIter;
+
+	//Initialize lookup list
+	auto findTargetInit=[&](const std::string & addr,Cycliclist<std::string> &clist)->bool
+	{
+       
+		Cycliclist<std::string>::iterator targetPosition;
+		//Find target location
+       
+		clist.filter([&](Cycliclist<std::string>::iterator iter){
+			if(iter->data == addr){
+				targetPosition = iter;
+				targetIter = iter;
+			}
+			return false;
+		});
+
+        if(targetPosition==Cycliclist<std::string>::iterator(nullptr)){
+           
+		    
+            return false;
+        }
+		Cycliclist<std::string>::iterator up;
+		Cycliclist<std::string>::iterator down;
+    
+		up=targetPosition - 1;
+		down=targetPosition + 1;
+     
+		int times = 0;
+		while(times < clist.size() / 2){	
+			if(up != down && up-1 != down && down+1 != up)
+			{
+             
+				upperBoundary.push_back(up);
+				lowerBoundary.push_back(down);
+				up--;
+				down++;
+			}
+			else
+			{
+				break;
+			}
+			times++;
+		}
+        return true;
+	};
+
+	//Find adjacent nodes up
+	auto findUpperBoundIterator= [&](int times, Cycliclist<std::string> & nodeList)->std::pair<Cycliclist<std::string>::iterator,int>
+	{
+		std::pair<Cycliclist<std::string>::iterator,int> res;
+        res.second = 0;
+
+        try {
+            if (times >= upperBoundary.size() || times >= lowerBoundary.size()) 
+			{
+                ERRORLOG("find times is over! "
+                         "[times:{}],[upperBoundary.size:{}],[lowerBoundary.size:{}]",
+                         times, upperBoundary.size(), lowerBoundary.size());
+                res.second = -1033;
+                return res;
+            }
+
+            Cycliclist<std::string>::iterator iter = nodeList.begin();
+            if(iter == Cycliclist<std::string>::iterator(nullptr))
+			{
+                 res.second=-1;
+                 return res;
+            }
+            for (; iter != nodeList.end(); iter++) {
+                if(upperBoundary[times] == Cycliclist<std::string>::iterator(nullptr))
+				{
+                    res.second=-1;
+                    return res;
+                }
+                if (upperBoundary[times]->data == iter->data) 
+				{
+                    res.first = iter;
+                    res.second = 0;
+                }
+            }
+             if(upperBoundary[times] == Cycliclist<std::string>::iterator(nullptr))
+			 {      
+                    res.second = -1;
+                    return res;
+            }
+            if (upperBoundary[times]->data == iter->data) 
+			{
+                res.first = iter;
+                res.second = 0;
+            }
+
+        } catch (std::exception &e) {
+            res.second = -3;
+        }
+        return res;
+	};
+
+	//Find adjacent nodes down
+	auto get_lower_iterator = [&](int times, Cycliclist<std::string> & nodeList)->std::pair<Cycliclist<std::string>::iterator,int>
+	{
+		std::pair<Cycliclist<std::string>::iterator,int> res;
+        res.second = 0;
+
+		if(times >= upperBoundary.size() || times >= lowerBoundary.size())
+		{
+			ERRORLOG("find times is over! [times:{}],[upperBoundary.size:{}],[lowerBoundary.size:{}]",times,upperBoundary.size(),lowerBoundary.size());
+			res.second=-1033;
+			return res;
+		}
+        try{
+            Cycliclist<std::string>::iterator iter = nodeList.begin();
+            if(iter == Cycliclist<std::string>::iterator(nullptr))
+			{
+                 res.second = -1;
+                 return res;
+            }
+            for (; iter != nodeList.end(); iter++) {
+                 if(lowerBoundary[times] == Cycliclist<std::string>::iterator(nullptr))
+				 {
+                    res.second = -1;
+                    return res;
+                 }
+                if (lowerBoundary[times] -> data == iter-> data) {
+                    res.first = iter;
+
+                    res.second = 0;
+                }
+            }
+            if(lowerBoundary[times] == Cycliclist<std::string>::iterator(nullptr))
+			{       
+                    res.second = -1;
+                    return res;
+            }
+            if (lowerBoundary[times]->data == iter->data) 
+			{
+                res.first = iter;
+                res.second = 0;
+            }
+        } catch (std::exception &e) {
+            res.second = -3;
+        }
+        return res;
+	};
+	int findTimes = 0;
+	if(msg->type() == 1)
+	{
+		Cycliclist<std::string> target_address_cycle_list;
+		initializeCyclicTargetAddresses(msg, target_address_cycle_list);
+
+		std::string defaultAddress = MagicSingleton<AccountManager>::GetInstance()->GetDefaultAddr();
+		bool isTargetFound = findTargetInit(defaultAddress, target_address_cycle_list);
+
+        if(isTargetFound == false)
+		{
+            return -1;
+        }
+
+		Cycliclist<std::string> cyclicNodeList;
+		initialize_cyclic_node_list(cyclicNodeList);
+
+		msg->set_type(2);
+		for(;findTimes < upperBoundary.size() && findTimes < lowerBoundary.size(); findTimes++)
+		{
+			auto upIter = findUpperBoundIterator(findTimes, cyclicNodeList);
+            if(upIter.second != 0)
+			{   
+                return -1;
+            }
+			auto downIter = get_lower_iterator(findTimes, cyclicNodeList);
+            if(downIter.second != 0)
+			{
+                return -1;
+            }
+          
+			Cycliclist<std::string>::iterator startIterator = upIter.first;
+			Cycliclist<std::string>::iterator endIterator = downIter.first;
+
+			if(startIterator == Cycliclist<std::string>::iterator(nullptr) || endIterator == Cycliclist<std::string>::iterator(nullptr))
+			{
+				continue;
+			}
+			else
+			{
+				for(; startIterator != endIterator; startIterator++)
+				{
+					if(startIterator->data != defaultAddress)
+					{
+						MagicSingleton<TaskPool>::GetInstance()->commitBroadcastRequest(std::bind(&net_com::SendMessageTask, startIterator->data, *msg));
+					}
+				}
+				if(startIterator->data != defaultAddress)
+				{
+					MagicSingleton<TaskPool>::GetInstance()->commitBroadcastRequest(std::bind(&net_com::SendMessageTask, startIterator->data, *msg));
+				}
+				break;
+			}
+		}
+	}
+	return 0;
+}
+
+
+int handleGetTxUtxoHashRequest(const std::shared_ptr<GetUtxoHashReq>& req, const MsgData& from){
+	if (0 != Util::IsVersionCompatible(req->version()))
+	{
+		ERRORLOG("handleGetTxUtxoHashRequest IsVersionCompatible");
+		return -1;
+	}
+
+	DBReader dbReader;
+	std::string txRaw;
+
+	GetUtxoHashAck ack;
+	ack.set_version(global::GetVersion());
+	ack.set_msg_id(req->msg_id());
+	for(auto & hash : req->utxohash())
+	{
+		CorresHash * correctionHash =  ack.add_flaghash();
+		correctionHash->set_hash(hash);
+		if(DBStatus::DB_SUCCESS == dbReader.getTransactionByHash(hash, txRaw))
+		{
+			correctionHash->set_flag(1);
+		}
+		else
+		{
+			correctionHash->set_flag(0);
+		}
+	}
+
+	net_com::SendMessage(from, ack, net_com::Compress::COMPRESS_TRUE, net_com::Encrypt::ENCRYPT_FALSE, net_com::Priority::kHighPriorityLevel2);
+
+	return 0;
+}
+
+int handleGetTxUtxoHashAcknowledgment(const std::shared_ptr<GetUtxoHashAck>& ack, const MsgData& from){
+	if (0 != Util::IsVersionCompatible(ack->version()))
+	{
+		ERRORLOG("handleGetTxUtxoHashAcknowledgment IsVersionCompatible");
+		return -1;
+	}
+	Node node;
+    if(!MagicSingleton<PeerNode>::GetInstance()->locateNodeByFd(from.fd, node))
+    {
+        ERRORLOG("Invalid message ");
+        return -2;
+    }
+	dataMgrPtr.waitDataToAdd(ack->msg_id(), node.address, ack->SerializeAsString());
+
+	return 0;
+
+}

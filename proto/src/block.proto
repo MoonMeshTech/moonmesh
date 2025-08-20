@@ -1,0 +1,156 @@
+/**
+ * *****************************************************************************
+ * @file        block.proto
+ * @brief       Block-related agreements
+ * @author  ()
+ * @date        2023-09-27
+ * @copyright   mm
+ * *****************************************************************************
+ */
+
+syntax = "proto3";
+
+import "transaction.proto";
+import "sign.proto";
+
+//block related information
+message CBlock {
+  uint32 version    = 1;  //block version
+  uint64 time       = 2;  //block creation time
+  string hash       = 3;  //block hash
+  string prevHash   = 4;  //block prev hash
+  int64 height      = 5;  //block height
+  string merkleRoot = 6;  //Merkle
+  repeated CTransaction txs = 7;  //all transactions in the block
+  string data       = 8;  //block data
+  string info       = 9;  //block info
+
+  repeated CSign sign = 10; //block sign
+
+  string reserve0   = 11;
+  string reserve1   = 12;
+}
+
+//block transfer information
+message BlockMsg
+{
+  uint64    nonce               = 1;
+  string    version             = 2;  //block version
+  sint32    code                = 3;  //error number
+  string    message             = 4;  //message
+  uint64    time                = 5;  //block transfer time
+  bytes     block               = 6;  //block related information 
+  repeated string verifyAddrs   = 7; 
+}
+
+message SendReconnectNodeReq
+{
+  BlockMsg msg = 1;
+  repeated string  sendAddress = 2;
+  string msg_id   = 3;
+}
+
+message SendReconnectNodeAck
+{
+  BlockMsg msg = 1;
+  repeated string sucsend = 2;
+  string msg_id      = 3;
+}
+
+
+//transaction status
+message TxStatus
+{
+  string  txHash      = 1;  //transaction hash
+  int32   status      = 2;  //error num
+}
+
+//block status
+message BlockStatus
+{
+  string              blockHash   = 1;  //block hash
+  int32               status      = 2;  //error number
+  repeated TxStatus   txStatus    = 3;  //fail transaction
+  string              id          = 4;  //SelfNodeId
+}
+
+//seek preHash by hight
+message SeekPreHashByHightReq
+{
+    string                  self_node_id         = 1; //self node id
+    string                  msg_id               = 2; //sign massage
+    uint64 		              seek_height          = 3; //seek height
+}
+
+//send seek preHash by hight
+message SeekPreHashByHightAck
+{
+    string                  self_node_id       = 1; //self node id
+    string                  msg_id             = 2; //sign massage
+    uint64 		              seek_height        = 3; //seek height
+    repeated string         prehashes          = 4; //prehashes
+}
+
+
+message preHashPair
+{
+  string ContractAddr = 1;
+  string RootHash = 2;
+  bytes blockRaw = 3;
+}
+
+
+message newSeekContractPreHashReq
+{
+  string version = 1;
+  string msg_id  = 2;
+  string self_node_id = 3;
+  repeated preHashPair seekRootHash = 4;
+}
+
+message newSeekContractPreHashAck
+{
+  string version = 1;
+  string msg_id  = 2;
+  string self_node_id = 3;
+  repeated preHashPair seekContractBlock = 4;
+}
+
+message CheckVinReq
+{
+  string version = 1;
+  string msg_id = 2;
+  string self_node_id = 3;
+  repeated string utxoHash = 4;
+}
+
+message CheckVinAck
+{
+  string version = 1;
+  string msg_id = 2;
+  string self_node_id = 3;
+  bool utxo_ok = 4;
+}
+
+
+message CheckContractPreHashPair
+{
+  string contract_addr = 1;
+  string prev_tx_hash = 2;
+}
+
+message CheckContractPreHashReq
+{
+  string version = 1;
+  string msg_id = 2;
+  string self_node_id = 3;
+  repeated CheckContractPreHashPair contract_pre_hash = 4;
+}
+
+message CheckContractPreHashAck
+{
+  string version = 1;
+  string msg_id = 2;
+  string self_node_id = 3;
+  bool contract_pre_hash_ok = 4;
+}

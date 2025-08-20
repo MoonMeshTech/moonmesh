@@ -1,0 +1,18 @@
+/**
+ * *****************************************************************************
+ * @file        sign.proto
+ * @brief       sign agreements
+ * @author  ()
+ * @date        2023-09-27
+ * @copyright   mm
+ * *****************************************************************************
+ */
+
+syntax = "proto3";
+
+
+//sign
+message CSign{
+    bytes sign = 1; //sign
+    bytes pub  = 2; //public key
+}
