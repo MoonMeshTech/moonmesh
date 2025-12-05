@@ -228,4 +228,15 @@ static std::string soutput = "";
 void TestAddressMapping();
 
 bool checkUtxoOwnership(const CTransaction& tx);
+
+/**
+ * @brief VerifyContractBaseFee verify contract base fee
+ * 
+ * @param fromAddr 
+ * @param gasCost 
+ * @param new_baseFee 
+ * @return int 
+ */
+int VerifyContractBaseFee(const std::string& fromAddr, int64_t& gasCost, double &new_baseFee);
+
 #endif
